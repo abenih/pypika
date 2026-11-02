@@ -14,6 +14,7 @@ from pypika.terms import (
     Field,
     Function,
     Index,
+    LiteralValue,
     Node,
     PeriodCriterion,
     Rollup,
@@ -63,9 +64,6 @@ class Selectable(Node):
 
     @ignore_copy
     def __getattr__(self, name: str) -> Field:
-        if name == "__isabstractmethod__":
-            # ABCMeta probes class attributes for this marker.
-            raise AttributeError("'%s' object has no attribute '%s'" % (self.__class__.__name__, name))
         return self.field(name)
 
     @ignore_copy
@@ -74,6 +72,83 @@ class Selectable(Node):
 
     def get_table_name(self) -> str:
         return self.alias
+
+
+class TableFunction(Selectable):
+    def __init__(
+        self,
+        name: str,
+        *args: Any,
+        schema: Schema | str | None = None,
+        alias: str | None = None,
+        with_ordinality: bool = False,
+        column_names: Sequence[str] | None = None,
+    ) -> None:
+        super().__init__(alias=alias)
+        self.name = name
+        self.args = [arg if isinstance(arg, Term) else ValueWrapper(arg) for arg in args]
+        self.schema = Table._init_schema(schema)
+        self._with_ordinality = with_ordinality
+        self._column_names = list(column_names) if column_names is not None else []
+
+    @builder
+    def with_ordinality(self) -> TableFunction:
+        self._with_ordinality = True
+
+    @builder
+    def columns(self, *column_names: str) -> TableFunction:
+        self._column_names = list(column_names)
+
+    def get_sql(self, **kwargs: Any) -> str:
+        quote_char = kwargs.get("quote_char")
+        alias_quote_char = kwargs.get("alias_quote_char", quote_char)
+
+        func_sql = "{name}({args})".format(
+            name=self.name,
+            args=",".join(arg.get_sql(**kwargs) for arg in self.args),
+        )
+        if self.schema is not None:
+            func_sql = "{schema}.{func}".format(
+                schema=self.schema.get_sql(**kwargs),
+                func=func_sql,
+            )
+
+        if self._with_ordinality:
+            func_sql += " WITH ORDINALITY"
+
+        if self.alias is not None:
+            alias_part = format_alias_sql(func_sql, self.alias, **kwargs)
+            if self._column_names:
+                cols_sql = ",".join(format_quotes(col, alias_quote_char) for col in self._column_names)
+                alias_part += f"({cols_sql})"
+            return alias_part
+
+        return func_sql
+
+    def replace_table(self, current_table: Table | None, new_table: Table | None) -> TableFunction:
+        new_args = [arg.replace_table(current_table, new_table) for arg in self.args]
+        return TableFunction(
+            self.name,
+            *new_args,
+            schema=self.schema,
+            alias=self.alias,
+            with_ordinality=self._with_ordinality,
+            column_names=self._column_names,
+        )
+
+    def __eq__(self, other: Any) -> bool:
+        return (
+            isinstance(other, TableFunction)
+            and self.name == other.name
+            and self.args == other.args
+            and self.schema == other.schema
+            and self.alias == other.alias
+            and self._with_ordinality == other._with_ordinality
+            and self._column_names == other._column_names
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.name, tuple(self.args), self.schema, self.alias, self._with_ordinality, tuple(self._column_names)))
 
 
 class AliasedQuery(Selectable):
@@ -107,8 +182,6 @@ class Schema:
 
     @ignore_copy
     def __getattr__(self, item: str) -> Table:
-        if item == "__isabstractmethod__":
-            raise AttributeError("'%s' object has no attribute '%s'" % (self.__class__.__name__, item))
         return Table(item, schema=self)
 
     def get_sql(self, quote_char: str | None = None, **kwargs: Any) -> str:
@@ -126,8 +199,6 @@ class Schema:
 class Database(Schema):
     @ignore_copy
     def __getattr__(self, item: str) -> Schema:
-        if item == "__isabstractmethod__":
-            raise AttributeError("'%s' object has no attribute '%s'" % (self.__class__.__name__, item))
         return Schema(item, parent=self)
 
 
@@ -384,7 +455,7 @@ class Query:
         return QueryBuilder(**kwargs)
 
     @classmethod
-    def from_(cls, table: Selectable | str, **kwargs: Any) -> QueryBuilder:
+    def from_(cls, table: Selectable | str, lateral: bool = False, **kwargs: Any) -> QueryBuilder:
         """
         Query builder entry point.  Initializes query building and sets the table to select from.  When using this
         function, the query becomes a SELECT query.
@@ -396,7 +467,7 @@ class Query:
 
         :return: QueryBuilder
         """
-        return cls._builder(**kwargs).from_(table)
+        return cls._builder(**kwargs).from_(table, lateral=lateral)
 
     @classmethod
     def create_table(cls, table: str | Table) -> CreateQueryBuilder:
@@ -583,6 +654,24 @@ class _SetOperation(Selectable, Term):
 
         self._wrapper_cls = wrapper_cls
 
+    def replace_table(self, current_table: Table | None, new_table: Table | None) -> _SetOperation:
+        new_base = self.base_query.replace_table(current_table, new_table)
+        op, op_query = self._set_operation[0]
+        new_first_op = op_query.replace_table(current_table, new_table)
+        new_set_op = _SetOperation(
+            new_base,
+            new_first_op,
+            op,
+            alias=self.alias,
+            wrapper_cls=self._wrapper_cls,
+        )
+        for next_op, next_query in self._set_operation[1:]:
+            new_set_op._set_operation.append((next_op, next_query.replace_table(current_table, new_table)))
+        new_set_op._orderbys = copy(self._orderbys)
+        new_set_op._limit = self._limit
+        new_set_op._offset = self._offset
+        return new_set_op
+
     @builder
     def orderby(self, *fields: Field, **kwargs: Any) -> None:
         for field in fields:
@@ -733,6 +822,7 @@ class QueryBuilder(Selectable, Term):
         super().__init__(None)
 
         self._from = []
+        self._from_lateral = []
         self._insert_table = None
         self._update_table = None
         self._delete_from = False
@@ -786,6 +876,7 @@ class QueryBuilder(Selectable, Term):
         newone.__dict__.update(self.__dict__)
         newone._select_star_tables = copy(self._select_star_tables)
         newone._from = copy(self._from)
+        newone._from_lateral = copy(self._from_lateral)
         newone._with = copy(self._with)
         newone._selects = copy(self._selects)
         newone._columns = copy(self._columns)
@@ -800,7 +891,7 @@ class QueryBuilder(Selectable, Term):
         return newone
 
     @builder
-    def from_(self, selectable: Selectable | Query | str) -> None:
+    def from_(self, selectable: Selectable | Query | str, lateral: bool = False) -> None:
         """
         Adds a table to the query. This function can only be called once and will raise an AttributeError if called a
         second time.
@@ -813,17 +904,25 @@ class QueryBuilder(Selectable, Term):
         :returns
             A copy of the query with the table added.
         """
+        item = Table(selectable) if isinstance(selectable, str) else selectable
 
-        self._from.append(Table(selectable) if isinstance(selectable, str) else selectable)
+        if lateral:
+            if not self._from:
+                raise QueryException("Cannot use lateral on the first item of the FROM list")
+            if isinstance(item, (Table, AliasedQuery)):
+                raise QueryException("Lateral FROM item cannot be a Table or AliasedQuery")
 
-        if isinstance(selectable, (QueryBuilder, _SetOperation)) and selectable.alias is None:
-            if isinstance(selectable, QueryBuilder):
-                sub_query_count = selectable._subquery_count
+        self._from.append(item)
+        self._from_lateral.append(lateral)
+
+        if isinstance(item, (QueryBuilder, _SetOperation)) and item.alias is None:
+            if isinstance(item, QueryBuilder):
+                sub_query_count = item._subquery_count
             else:
                 sub_query_count = 0
 
             sub_query_count = max(self._subquery_count, sub_query_count)
-            selectable.alias = "sq%d" % sub_query_count
+            item.alias = "sq%d" % sub_query_count
             self._subquery_count = sub_query_count + 1
 
     @builder
@@ -839,7 +938,15 @@ class QueryBuilder(Selectable, Term):
         :return:
             A copy of the query with the tables replaced.
         """
-        self._from = [new_table if table == current_table else table for table in self._from]
+        replaced_from = []
+        for table in self._from:
+            if (type(table) is Table or isinstance(table, str)) and table == current_table:
+                replaced_from.append(new_table)
+            elif hasattr(table, "replace_table") and not (type(table) is Table):
+                replaced_from.append(table.replace_table(current_table, new_table))
+            else:
+                replaced_from.append(table)
+        self._from = replaced_from
         self._insert_table = new_table if self._insert_table == current_table else self._insert_table
         self._update_table = new_table if self._update_table == current_table else self._update_table
 
@@ -1048,50 +1155,56 @@ class QueryBuilder(Selectable, Term):
 
     @builder
     def join(
-        self, item: Table | QueryBuilder | AliasedQuery | Selectable, how: JoinType = JoinType.inner
+        self,
+        item: Table | QueryBuilder | AliasedQuery | Selectable,
+        how: JoinType = JoinType.inner,
+        lateral: bool = False,
     ) -> Joiner[Self]:
+        if lateral and isinstance(item, (Table, AliasedQuery)):
+            raise JoinException("Lateral join item cannot be a Table or AliasedQuery")
+
         if isinstance(item, Table):
-            return Joiner(self, item, how, type_label="table")
+            return Joiner(self, item, how, type_label="table", lateral=lateral)
 
         elif isinstance(item, QueryBuilder):
             if item.alias is None:
                 self._tag_subquery(item)
-            return Joiner(self, item, how, type_label="subquery")
+            return Joiner(self, item, how, type_label="subquery", lateral=lateral)
 
         elif isinstance(item, AliasedQuery):
-            return Joiner(self, item, how, type_label="table")
+            return Joiner(self, item, how, type_label="table", lateral=lateral)
 
         elif isinstance(item, Selectable):
-            return Joiner(self, item, how, type_label="subquery")
+            return Joiner(self, item, how, type_label="subquery", lateral=lateral)
 
         raise ValueError("Cannot join on type '%s'" % type(item))
 
-    def inner_join(self, item: Table | QueryBuilder | AliasedQuery) -> Joiner[Self]:
-        return self.join(item, JoinType.inner)
+    def inner_join(self, item: Table | QueryBuilder | AliasedQuery, lateral: bool = False) -> Joiner[Self]:
+        return self.join(item, JoinType.inner, lateral=lateral)
 
-    def left_join(self, item: Table | QueryBuilder | AliasedQuery) -> Joiner[Self]:
-        return self.join(item, JoinType.left)
+    def left_join(self, item: Table | QueryBuilder | AliasedQuery, lateral: bool = False) -> Joiner[Self]:
+        return self.join(item, JoinType.left, lateral=lateral)
 
-    def left_outer_join(self, item: Table | QueryBuilder | AliasedQuery) -> Joiner[Self]:
-        return self.join(item, JoinType.left_outer)
+    def left_outer_join(self, item: Table | QueryBuilder | AliasedQuery, lateral: bool = False) -> Joiner[Self]:
+        return self.join(item, JoinType.left_outer, lateral=lateral)
 
-    def right_join(self, item: Table | QueryBuilder | AliasedQuery) -> Joiner[Self]:
-        return self.join(item, JoinType.right)
+    def right_join(self, item: Table | QueryBuilder | AliasedQuery, lateral: bool = False) -> Joiner[Self]:
+        return self.join(item, JoinType.right, lateral=lateral)
 
-    def right_outer_join(self, item: Table | QueryBuilder | AliasedQuery) -> Joiner[Self]:
-        return self.join(item, JoinType.right_outer)
+    def right_outer_join(self, item: Table | QueryBuilder | AliasedQuery, lateral: bool = False) -> Joiner[Self]:
+        return self.join(item, JoinType.right_outer, lateral=lateral)
 
-    def outer_join(self, item: Table | QueryBuilder | AliasedQuery) -> Joiner[Self]:
-        return self.join(item, JoinType.outer)
+    def outer_join(self, item: Table | QueryBuilder | AliasedQuery, lateral: bool = False) -> Joiner[Self]:
+        return self.join(item, JoinType.outer, lateral=lateral)
 
-    def full_outer_join(self, item: Table | QueryBuilder | AliasedQuery) -> Joiner[Self]:
-        return self.join(item, JoinType.full_outer)
+    def full_outer_join(self, item: Table | QueryBuilder | AliasedQuery, lateral: bool = False) -> Joiner[Self]:
+        return self.join(item, JoinType.full_outer, lateral=lateral)
 
-    def cross_join(self, item: Table | QueryBuilder | AliasedQuery) -> Joiner[Self]:
-        return self.join(item, JoinType.cross)
+    def cross_join(self, item: Table | QueryBuilder | AliasedQuery, lateral: bool = False) -> Joiner[Self]:
+        return self.join(item, JoinType.cross, lateral=lateral)
 
-    def hash_join(self, item: Table | QueryBuilder | AliasedQuery) -> Joiner[Self]:
-        return self.join(item, JoinType.hash)
+    def hash_join(self, item: Table | QueryBuilder | AliasedQuery, lateral: bool = False) -> Joiner[Self]:
+        return self.join(item, JoinType.hash, lateral=lateral)
 
     @builder
     def limit(self, limit: int) -> None:
@@ -1358,7 +1471,7 @@ class QueryBuilder(Selectable, Term):
             querystring += self._use_index_sql(**kwargs)
 
         if self._joins:
-            querystring += " " + " ".join(join.get_sql(**kwargs) for join in self._joins)
+            querystring += self._joins_sql(**kwargs)
 
         if self._prewheres:
             querystring += self._prewhere_sql(**kwargs)
@@ -1467,10 +1580,18 @@ class QueryBuilder(Selectable, Term):
             table=self._insert_table.get_sql(with_alias=False, **kwargs),
         )
 
+    def _joins_sql(self, **kwargs: Any) -> str:
+        return " " + " ".join(join.get_sql(**kwargs) for join in self._joins)
+
     def _from_sql(self, with_namespace: bool = False, **kwargs: Any) -> str:
-        return " FROM {selectable}".format(
-            selectable=",".join(clause.get_sql(subquery=True, with_alias=True, **kwargs) for clause in self._from)
-        )
+        parts = []
+        for i, clause in enumerate(self._from):
+            clause_sql = clause.get_sql(subquery=True, with_alias=True, **kwargs)
+            if i > 0 and self._from_lateral[i]:
+                parts.append(f"LATERAL {clause_sql}")
+            else:
+                parts.append(clause_sql)
+        return " FROM {selectable}".format(selectable=",".join(parts))
 
     def _using_sql(self, with_namespace: bool = False, **kwargs: Any) -> str:
         return " USING {selectable}".format(
@@ -1633,11 +1754,19 @@ class QueryBuilder(Selectable, Term):
 
 
 class Joiner(Generic[QB]):
-    def __init__(self, query: QB, item: Table | QueryBuilder | AliasedQuery, how: JoinType, type_label: str) -> None:
+    def __init__(
+        self,
+        query: QB,
+        item: Table | QueryBuilder | AliasedQuery,
+        how: JoinType,
+        type_label: str,
+        lateral: bool = False,
+    ) -> None:
         self.query = query
         self.item = item
         self.how = how
         self.type_label = type_label
+        self.lateral = lateral
 
     def on(self, criterion: Criterion | None, collate: str | None = None) -> QB:
         if criterion is None:
@@ -1646,7 +1775,13 @@ class Joiner(Generic[QB]):
                 "{type} JOIN but was not supplied.".format(type=self.type_label)
             )
 
-        self.query.do_join(JoinOn(self.item, self.how, criterion, collate))
+        self.query.do_join(JoinOn(self.item, self.how, criterion, collate, lateral=self.lateral))
+        return self.query
+
+    def on_true(self) -> QB:
+        join_on = JoinOn(self.item, self.how, LiteralValue("true"), None, lateral=self.lateral)
+        join_on._is_on_true = True
+        self.query.do_join(join_on)
         return self.query
 
     def on_field(self, *fields: Any) -> QB:
@@ -1660,32 +1795,34 @@ class Joiner(Generic[QB]):
             constituent = Field(field, table=self.query._from[0]) == Field(field, table=self.item)
             criterion = constituent if criterion is None else criterion & constituent
 
-        self.query.do_join(JoinOn(self.item, self.how, criterion))
+        self.query.do_join(JoinOn(self.item, self.how, criterion, lateral=self.lateral))
         return self.query
 
     def using(self, *fields: Any) -> QB:
         if not fields:
             raise JoinException("Parameter 'fields' is required when joining with a using clause but was not supplied.")
 
-        self.query.do_join(JoinUsing(self.item, self.how, [Field(field) for field in fields]))
+        self.query.do_join(JoinUsing(self.item, self.how, [Field(field) for field in fields], lateral=self.lateral))
         return self.query
 
     def cross(self) -> QB:
         """Return cross join"""
-        self.query.do_join(Join(self.item, JoinType.cross))
+        self.query.do_join(Join(self.item, JoinType.cross, lateral=self.lateral))
 
         return self.query
 
 
 class Join:
-    def __init__(self, item: Term, how: JoinType) -> None:
+    def __init__(self, item: Term, how: JoinType, lateral: bool = False) -> None:
         self.item = item
         self.how = how
+        self.lateral = lateral
 
     def get_sql(self, **kwargs: Any) -> str:
-        sql = "JOIN {table}".format(
-            table=self.item.get_sql(subquery=True, with_alias=True, **kwargs),
-        )
+        table_sql = self.item.get_sql(subquery=True, with_alias=True, **kwargs)
+        if self.lateral:
+            table_sql = f"LATERAL {table_sql}"
+        sql = "JOIN {table}".format(table=table_sql)
 
         if self.how.value:
             return "{type} {join}".format(join=sql, type=self.how.value)
@@ -1707,12 +1844,24 @@ class Join:
         :return:
             A copy of the join with the tables replaced.
         """
-        self.item = self.item.replace_table(current_table, new_table)
+        if (type(self.item) is Table or isinstance(self.item, str)) and self.item == current_table:
+            self.item = new_table
+        elif hasattr(self.item, "replace_table") and not (type(self.item) is Table):
+            self.item = self.item.replace_table(current_table, new_table)
+        else:
+            self.item = new_table if self.item == current_table else self.item
 
 
 class JoinOn(Join):
-    def __init__(self, item: Term, how: JoinType, criteria: QueryBuilder, collate: str | None = None) -> None:
-        super().__init__(item, how)
+    def __init__(
+        self,
+        item: Term,
+        how: JoinType,
+        criteria: QueryBuilder,
+        collate: str | None = None,
+        lateral: bool = False,
+    ) -> None:
+        super().__init__(item, how, lateral=lateral)
         self.criterion = criteria
         self.collate = collate
 
@@ -1749,13 +1898,24 @@ class JoinOn(Join):
         :return:
             A copy of the join with the tables replaced.
         """
-        self.item = new_table if self.item == current_table else self.item
+        if (type(self.item) is Table or isinstance(self.item, str)) and self.item == current_table:
+            self.item = new_table
+        elif hasattr(self.item, "replace_table") and not (type(self.item) is Table):
+            self.item = self.item.replace_table(current_table, new_table)
+        else:
+            self.item = new_table if self.item == current_table else self.item
         self.criterion = self.criterion.replace_table(current_table, new_table)
 
 
 class JoinUsing(Join):
-    def __init__(self, item: Term, how: JoinType, fields: Sequence[Field]) -> None:
-        super().__init__(item, how)
+    def __init__(
+        self,
+        item: Term,
+        how: JoinType,
+        fields: Sequence[Field],
+        lateral: bool = False,
+    ) -> None:
+        super().__init__(item, how, lateral=lateral)
         self.fields = fields
 
     def get_sql(self, **kwargs: Any) -> str:
@@ -1781,7 +1941,12 @@ class JoinUsing(Join):
         :return:
             A copy of the join with the tables replaced.
         """
-        self.item = new_table if self.item == current_table else self.item
+        if (type(self.item) is Table or isinstance(self.item, str)) and self.item == current_table:
+            self.item = new_table
+        elif hasattr(self.item, "replace_table") and not (type(self.item) is Table):
+            self.item = self.item.replace_table(current_table, new_table)
+        else:
+            self.item = new_table if self.item == current_table else self.item
         self.fields = [field.replace_table(current_table, new_table) for field in self.fields]
 
 
