@@ -5,7 +5,7 @@ import warnings
 from copy import copy
 from typing import Any
 
-from pypika.enums import Dialects
+from pypika.enums import Dialects, JoinType
 from pypika.queries import (
     CreateQueryBuilder,
     Database,
@@ -269,6 +269,9 @@ class VerticaQueryBuilder(QueryBuilder):
         self._hint = label
 
     def get_sql(self, *args: Any, **kwargs: Any) -> str:
+        if any(self._from_lateral) or any(getattr(join, "lateral", False) for join in self._joins):
+            raise QueryException("Lateral items are not supported in Vertica")
+
         sql = super().get_sql(*args, **kwargs)
 
         if self._hint is not None:
@@ -689,6 +692,11 @@ class RedshiftQuery(Query):
 class RedShiftQueryBuilder(QueryBuilder):
     QUERY_CLS = RedshiftQuery
 
+    def get_sql(self, *args: Any, **kwargs: Any) -> str:
+        if any(self._from_lateral) or any(getattr(join, "lateral", False) for join in self._joins):
+            raise QueryException("Lateral items are not supported in Redshift")
+        return super().get_sql(*args, **kwargs)
+
 
 class MSSQLQuery(Query):
     """
@@ -740,7 +748,51 @@ class MSSQLQueryBuilder(FetchNextAndOffsetRowsQueryBuilder):
         # MSSQL does not support group by a field alias.
         # Note: set directly in kwargs as they are re-used down the tree in the case of subqueries!
         kwargs['groupby_alias'] = False
+
+        # Validate lateral joins
+        for join in self._joins:
+            if getattr(join, "lateral", False):
+                is_on_true = getattr(join, "on_true", False)
+                is_cross = getattr(join, "completed_cross", False)
+                if join.how in (JoinType.inner, JoinType.cross) and (is_cross or is_on_true):
+                    pass
+                elif join.how in (JoinType.left, JoinType.left_outer) and is_on_true:
+                    pass
+                else:
+                    raise QueryException("Unsupported lateral join type or completion for MSSQL")
+
         return super().get_sql(*args, **kwargs)
+
+    def _from_sql(self, with_namespace: bool = False, **kwargs: Any) -> str:
+        if not self._from:
+            return ""
+
+        first_sql = self._from[0].get_sql(subquery=True, with_alias=True, **kwargs)
+        res = f" FROM {first_sql}"
+
+        for i in range(1, len(self._from)):
+            clause = self._from[i]
+            clause_sql = clause.get_sql(subquery=True, with_alias=True, **kwargs)
+            is_lat = self._from_lateral[i] if i < len(self._from_lateral) else False
+            if is_lat:
+                res = f"{res} CROSS APPLY {clause_sql}"
+            else:
+                res = f"{res},{clause_sql}"
+
+        return res
+
+    def _joins_sql(self, **kwargs: Any) -> str:
+        clauses = []
+        for join in self._joins:
+            if getattr(join, "lateral", False):
+                item_sql = join.item.get_sql(subquery=True, with_alias=True, **kwargs)
+                if join.how in (JoinType.inner, JoinType.cross):
+                    clauses.append(f"CROSS APPLY {item_sql}")
+                elif join.how in (JoinType.left, JoinType.left_outer):
+                    clauses.append(f"OUTER APPLY {item_sql}")
+            else:
+                clauses.append(join.get_sql(**kwargs))
+        return " " + " ".join(clauses)
 
     def _top_sql(self) -> str:
         _top_statement: str = ""
@@ -810,6 +862,11 @@ class ClickHouseQueryBuilder(QueryBuilder):
         self._sample_offset = None
         self._distinct_on = []
         self._limit_by = None
+
+    def get_sql(self, *args: Any, **kwargs: Any) -> str:
+        if any(self._from_lateral) or any(getattr(join, "lateral", False) for join in self._joins):
+            raise QueryException("Lateral items are not supported in ClickHouse")
+        return super().get_sql(*args, **kwargs)
 
     def __copy__(self) -> ClickHouseQueryBuilder:
         newone = super().__copy__()
@@ -964,6 +1021,11 @@ class SQLLiteQueryBuilder(QueryBuilder):
         self._apply_terms(*terms)
         self._replace = True
         self._insert_or_replace = True
+
+    def get_sql(self, *args: Any, **kwargs: Any) -> str:
+        if any(self._from_lateral) or any(getattr(join, "lateral", False) for join in self._joins):
+            raise QueryException("Lateral items are not supported in SQLite")
+        return super().get_sql(*args, **kwargs)
 
     def _replace_sql(self, **kwargs: Any) -> str:
         prefix = "INSERT OR " if self._insert_or_replace else ""
